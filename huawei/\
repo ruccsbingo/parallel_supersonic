@@ -1,0 +1,217 @@
+#include <stddef.h>
+#include <stdio.h>
+#include <iostream>
+#include <pthread.h>
+
+#include <limits>
+using std::numeric_limits;
+
+#include "supersonic/supersonic.h"
+#include "supersonic/utils/strings/stringpiece.h"
+#include "supersonic/cursor/infrastructure/view_cursor.h"
+#include "supersonic/utils/scoped_ptr.h"
+#include "supersonic/utils/exception/failureor.h"
+#include "supersonic/base/exception/exception.h"
+#include "supersonic/base/exception/exception_macros.h"
+#include "supersonic/base/exception/result.h"
+#include "supersonic/base/infrastructure/projector.h"
+#include "supersonic/base/infrastructure/tuple_schema.h"
+#include "supersonic/base/memory/memory.h"
+#include "supersonic/cursor/base/cursor.h"
+#include "supersonic/cursor/base/cursor_transformer.h"
+#include "supersonic/cursor/base/operation.h"
+#include "supersonic/cursor/core/aggregate.h"
+#include "supersonic/cursor/core/aggregate_groups.h"
+#include "supersonic/cursor/core/aggregator.h"
+#include "supersonic/cursor/core/spy.h"
+#include "supersonic/cursor/core/sort.h"
+#include "supersonic/cursor/infrastructure/ordering.h"
+#include "supersonic/proto/supersonic.pb.h"
+#include "supersonic/testing/block_builder.h"
+#include "supersonic/testing/comparators.h"
+#include "gtest/gtest.h"
+#include "supersonic/utils/container_literal.h"
+
+#include "huawei/pthreads/barrier.h"
+
+using namespace supersonic;
+
+typedef struct ThreadTag{
+    pthread_t thread_id;
+    int number;
+    Table * table;
+    Table * result_table;
+    GroupKeySet * key;
+}ThreadTag;
+
+int single_thread();
+
+int parallel_local_hashtable_aggregate(int threads_num);
+
+int parallel_global_hashtable_aggregate(int threads_num);
+
+void thread_local_hashtable_aggregate(void * args);
+
+Table ** create_output_tables(int threads_num);
+
+Table * create_table();
+
+barrier_t barrier;
+
+int main(int argc, char *argv[]){
+
+    single_thread();
+
+    return 0;
+}
+
+int single_thread(){
+
+    printf("hello world\n");
+
+    scoped_ptr<Table> table;
+    scoped_ptr<TableRowWriter> table_writer;
+
+    TupleSchema schema;
+
+    schema.add_attribute(Attribute("id", INT32, NOT_NULLABLE));
+    schema.add_attribute(Attribute("score", INT32, NOT_NULLABLE));
+
+    table.reset(new Table(schema, HeapBufferAllocator::Get()));
+    table_writer.reset(new TableRowWriter(table.get()));
+
+    for(int i=0; i<16; ++i){
+        printf("%d   %d\n", i*17%64, i*7%3);
+        table_writer->AddRow().Int32(i*17%64).Int32(i*7%3).CheckSuccess();
+    }
+
+    //--------------------------------------------------//
+
+    Operation* input = ScanView(table->view());
+
+    CompoundSingleSourceProjector * group_by_column = new CompoundSingleSourceProjector();
+    group_by_column->add(ProjectNamedAttribute("id"));
+
+    scoped_ptr<AggregationSpecification> aggregator(new AggregationSpecification());
+
+    aggregator->AddAggregation(SUM, "score", "sum");
+
+    scoped_ptr<Operation> group_agg_operator(
+            GroupAggregate(group_by_column, aggregator.release(), NULL, input));
+
+    scoped_ptr<Cursor> result_cursor;
+    result_cursor.reset(SucceedOrDie(group_agg_operator->CreateCursor()));
+
+    ResultView result(result_cursor->Next(-1));
+
+    for(int j=0; j<result.view().row_count();j++)
+    {
+        std::cout<<result.view().column(0).typed_data<INT32>()[j]<<"\t";
+
+        std::cout<<result.view().column(1).typed_data<INT32>()[j]<<"\t";
+
+        std::cout<<std::endl;
+    }
+
+
+    return 0;
+}
+
+void thread_local_hashtable_aggregate(void * args){
+
+    ThreadTag * thread = (ThreadTag *) args;
+
+
+    
+}
+
+int parallel_local_hashtable_aggregate(int threads_num){
+
+    int i, status;
+
+    Table * input_table = create_table();
+
+    Table ** result_tables = create_output_tables(threads_num);
+
+    barrier_init(&barrier, threads_num);
+
+    ThreadTag ** threads = (ThreadTag **) malloc(sizeof(ThreadTag *) * threads_num);
+    memset(threads, 0, sizeof(ThreadTag *) * threads_num);
+
+    for(i=0; i<threads_num; ++i){
+        threads[i] = (ThreadTag *) malloc(sizeof(ThreadTag));
+    }
+
+    for(i=0; i<threads_num; ++i){
+
+        threads[i]->number = i;
+
+        threads[i]->table = input_table;
+
+        threads[i]->result_table = result_tables[i];
+
+        threads[i]->key = NULL;
+
+        status = pthread_create(
+                &threads[i]->thread_id, 
+                0, 
+                thread_local_hashtable_aggregate, 
+                &threads[i]);
+
+        if(status != 0){
+            printf("%d %s\n", status, "create thread failure");
+            exit(-1);
+        }
+    }
+
+    for(i=0; i<threads_num; ++i){
+
+        status = pthread_join(threads[i].thread_id, NULL);
+
+        if(status != 0){
+            printf("%d %s\n", status, "Join thread failed");
+        }
+
+        //to do finial aggregate
+
+    }
+
+    barrier_destroy(&barrier);
+
+    return 0;
+}
+
+int parallel_global_hashtable_aggregate(int threads_num){
+
+    return 0;
+}
+
+Table * create_table(){
+
+    scoped_ptr<Table> table;
+    scoped_ptr<TableRowWriter> table_writer;
+
+    TupleSchema schema;
+
+    schema.add_attribute(Attribute("id", INT32, NOT_NULLABLE));
+    schema.add_attribute(Attribute("score", INT32, NOT_NULLABLE));
+
+    table.reset(new Table(schema, HeapBufferAllocator::Get()));
+    table_writer.reset(new TableRowWriter(table.get()));
+
+    for(int i=0; i<16; ++i){
+        printf("%d   %d\n", i*17%64, i*7%3);
+        table_writer->AddRow().Int32(i*17%64).Int32(i*7%3).CheckSuccess();
+    }
+
+    return Success(table->release());
+}
+
+Table ** create_output_tables(int threads_num){
+
+    Table ** tables = (Table **) malloc(sizeof(Table *) * threads_num);
+
+    for(int i=0; i<threads_num; ++i){
+        tables[i] = create_table();
+    }
+}

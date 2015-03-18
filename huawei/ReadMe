@@ -1,0 +1,7 @@
+本 Makefile 针对于 supersonic-0.9.3 和 CentOS。
+
+1. 解压 supersonic-0.9.3.tar.gz 得到 supersonic/
+
+2. 将 huawei/ 放置于 supersonic/ 之下
+
+3. 在 huawei/ 下 make

@@ -1,0 +1,395 @@
+// Copyright 2010 Google Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+#include <stddef.h>
+#include <algorithm>
+using std::copy;
+using std::max;
+using std::min;
+using std::reverse;
+using std::sort;
+using std::swap;
+#include <list>
+using std::list;
+#include <vector>
+using std::vector;
+
+#include <glog/logging.h>
+#include "supersonic/utils/logging-inl.h"
+#include "supersonic/utils/macros.h"
+#include "supersonic/utils/port.h"
+#include "supersonic/utils/scoped_ptr.h"
+#include "supersonic/utils/stringprintf.h"
+#include "supersonic/utils/exception/failureor.h"
+#include "supersonic/base/exception/exception.h"
+#include "supersonic/base/exception/exception_macros.h"
+#include "supersonic/base/exception/result.h"
+#include "supersonic/base/infrastructure/bit_pointers.h"
+#include "supersonic/base/infrastructure/block.h"
+#include "supersonic/base/infrastructure/projector.h"
+#include "supersonic/base/infrastructure/types.h"
+#include "supersonic/base/memory/memory.h"
+#include "supersonic/cursor/base/cursor.h"
+#include "supersonic/cursor/base/operation.h"
+#include "supersonic/cursor/proto/cursors.pb.h"
+#include "supersonic/cursor/core/aggregate.h"
+#include "supersonic/cursor/core/aggregator.h"
+#include "supersonic/cursor/core/hybrid_group_utils.h"
+#include "supersonic/cursor/core/sort.h"
+#include "supersonic/cursor/infrastructure/basic_cursor.h"
+#include "supersonic/cursor/infrastructure/basic_operation.h"
+#include "supersonic/cursor/infrastructure/iterators.h"
+#include "supersonic/cursor/infrastructure/ordering.h"
+#include "supersonic/cursor/infrastructure/row_hash_set.h"
+#include "supersonic/cursor/infrastructure/table.h"
+#include "supersonic/proto/supersonic.pb.h"
+#include "supersonic/utils/strings/join.h"
+#include "supersonic/utils/container_literal.h"
+#include "supersonic/utils/map-util.h"
+#include "supersonic/utils/pointer_vector.h"
+#include "supersonic/utils/stl_util.h"
+
+namespace supersonic {
+
+class TupleSchema;
+
+// Creates and updates a block of unique keys that are the result of grouping.
+class GroupKeySet {
+ public:
+  typedef row_hash_set::FindResult FindResult;  // Re-exporting.
+
+  // Creates a GroupKeySet. group_by_columns describes which columns constitute
+  // a key and should be grouped together, it can be empty, in which case all
+  // rows are considered equal and are grouped together. Set is pre-allocated
+  // to store initial_row_capacity unique keys, and it can grow as needed.
+  static FailureOrOwned<GroupKeySet> Create(
+      const BoundSingleSourceProjector* group_by,
+      BufferAllocator* allocator,
+      rowcount_t initial_row_capacity) {
+    scoped_ptr<GroupKeySet> group_key_set(new GroupKeySet(group_by, allocator));
+    PROPAGATE_ON_FAILURE(group_key_set->Init(initial_row_capacity));
+    return Success(group_key_set.release());
+  }
+
+  const TupleSchema& key_schema() const {
+    return key_projector_->result_schema();
+  }
+
+  // View on a block that keeps unique keys. Can be called only when key is not
+  // empty.
+  const View& key_view() const {
+    return key_row_set_.indexed_view();
+  }
+
+  // How many rows can a view passed in the next call to Insert() have.
+  // TODO(user): Remove this limitation (the row hash set could use a loop
+  // to insert more items that it can process in a single shot).
+  rowcount_t max_view_row_count_to_insert() const {
+    // Does not accept views larger then cursor::kDefaultRowCount because this
+    // is the size of preallocated table that holds result of Insert().
+    return Cursor::kDefaultRowCount;
+  }
+
+  // Count of unique keys in the set.
+  rowcount_t size() const { return key_row_set_.size(); }
+
+  // Inserts all unique keys from the view to the key block. For each row
+  // from input view finds an index of its key in the key block and puts
+  // these indexes in the result table.
+  // Input view can not have more rows then max_view_row_count_to_insert().
+  const rowid_t Insert(const View& view, FindResult* result) {
+    CHECK_LE(view.row_count(), max_view_row_count_to_insert());
+    key_projector_->Project(view, &child_key_view_);
+    child_key_view_.set_row_count(view.row_count());
+    return key_row_set_.Insert(child_key_view_, result);
+  }
+
+  void Reset() { key_row_set_.Clear(); }
+
+  void Compact() { key_row_set_.Compact(); }
+
+  GroupKeySet(const BoundSingleSourceProjector* group_by,
+              BufferAllocator* allocator,
+              rowcount_t initial_row_capacity) {
+      : key_projector_(group_by),
+        child_key_view_(key_projector_->result_schema()),
+        key_row_set_(key_projector_->result_schema(), allocator) {
+
+            Init(initial_row_capacity);
+        }
+
+  GroupKeySet(const BoundSingleSourceProjector* group_by,
+              BufferAllocator* allocator)
+      : key_projector_(group_by),
+        child_key_view_(key_projector_->result_schema()),
+        key_row_set_(key_projector_->result_schema(), allocator) {}
+  
+  FailureOrVoid Init(rowcount_t reserved_capacity) {
+    if (!key_row_set_.ReserveRowCapacity(reserved_capacity)) {
+      THROW(new Exception(
+          ERROR_MEMORY_EXCEEDED,
+          StrCat("Block allocation failed. Key block with capacity ",
+                 reserved_capacity, " not allocated.")));
+    }
+    return Success();
+  }
+
+ private:
+  scoped_ptr<const BoundSingleSourceProjector> key_projector_;
+
+  // View over an input view from child but with only key columns.
+  View child_key_view_;
+
+  row_hash_set::RowHashSet key_row_set_;
+
+  DISALLOW_COPY_AND_ASSIGN(GroupKeySet);
+};
+
+class RoughSafeGroupKeySet : public GroupKeySet{
+  public:
+      RoughSafeGroupKeySet(const BoundSingleSourceProjector* group_by,
+              BufferAllocator* allocator,
+              rowcount_t initial_row_capacity) 
+      : GroupKeySet(group_by, allocator, initial_row_capacity){}
+
+  private:
+
+
+      
+
+};
+
+// Cursor that is used for handling the standard GroupAggregate mode and
+// BestEffortGroupAggregate mode. The difference between these two modes is that
+// GroupAggregate needs to process the whole input during creation (returns out
+// of memory error if aggregation result is too large) and
+// BestEffortGroupAggregate does not process anything during creation and
+// processes as large chunks as possible during iteration phase, but does not
+// guarantee that the final result will be fully aggregated (i.e. there can be
+// more than one output for a given key). To make BestEffortGroupAggregate
+// deterministic (always producing the same output), pass GuaranteeMemory as its
+// allocator.
+class GroupAggregateCursor : public BasicCursor {
+ public:
+  // Creates the cursor. Returns immediately (w/o processing any input).
+  static FailureOrOwned<GroupAggregateCursor> Create(
+      const BoundSingleSourceProjector* group_by,
+      Aggregator* aggregator,
+      BufferAllocator* allocator,           // Takes ownership
+      BufferAllocator* original_allocator,  // Doesn't take ownership.
+      bool best_effort,
+      Cursor* child) {
+    scoped_ptr<BufferAllocator> allocator_owned(CHECK_NOTNULL(allocator));
+    scoped_ptr<Cursor> child_owner(child);
+    scoped_ptr<Aggregator> aggregator_owner(aggregator);
+    FailureOrOwned<GroupKeySet> key = GroupKeySet::Create(
+         group_by, allocator_owned.get(), aggregator_owner->capacity());
+    PROPAGATE_ON_FAILURE(key);
+    vector<const TupleSchema*> input_schemas(2);
+    input_schemas[0] = &key->key_schema();
+    input_schemas[1] = &aggregator->schema();
+    scoped_ptr<MultiSourceProjector> result_projector(
+        (new CompoundMultiSourceProjector())
+            ->add(0, ProjectAllAttributes())
+            ->add(1, ProjectAllAttributes()));
+    FailureOrOwned<const BoundMultiSourceProjector> bound_result_projector(
+        result_projector->Bind(input_schemas));
+    PROPAGATE_ON_FAILURE(bound_result_projector);
+    TupleSchema result_schema = bound_result_projector->result_schema();
+    return Success(
+        new GroupAggregateCursor(result_schema,
+                                 allocator_owned.release(),  // Takes ownership.
+                                 original_allocator,
+                                 key.release(),
+                                 aggregator_owner.release(),
+                                 bound_result_projector.release(),
+                                 best_effort,
+                                 child_owner.release()));
+  }
+
+  virtual ResultView Next(rowcount_t max_row_count) {
+    while (true) {
+      if (result_.next(max_row_count)) {
+        return ResultView::Success(&result_.view());
+      }
+      if (input_exhausted_) return ResultView::EOS();
+      // No rows from this call, yet input not exhausted. Retry.
+      PROPAGATE_ON_FAILURE(ProcessInput());
+      if (child_.is_waiting_on_barrier()) return ResultView::WaitingOnBarrier();
+    }
+  }
+
+  // If false, the Cursor will not return more data above what was already
+  // returned from Next() calls (unless TruncateResultView is called). This
+  // method can be used to determine if best-effort group managed to do full
+  // grouping:
+  // - Call .Next(numeric_limits<rowcount_t>::max())
+  // - Now if CanReturnMoreData() == false, we know that all the results of
+  // best-effort group are in a single view, which means that the data was fully
+  // aggregated.
+  // - TruncateResultView can be used to rewind the cursor to the beginning.
+  bool CanReturnMoreData() const {
+    return !input_exhausted_ ||
+        (result_.rows_remaining() > result_.row_count());
+  }
+
+  // Truncates the current result ViewIterator. If we only called Next() once,
+  // this rewinds the Cursor to the beginning.
+  bool TruncateResultView() {
+    return result_.truncate(0);
+  }
+
+  virtual bool IsWaitingOnBarrierSupported() const {
+    return child_.is_waiting_on_barrier_supported();
+  }
+
+  virtual void Interrupt() { child_.Interrupt(); }
+
+  virtual void ApplyToChildren(CursorTransformer* transformer) {
+    child_.ApplyToCursor(transformer);
+  }
+
+  virtual CursorId GetCursorId() const {
+    return best_effort_
+           ? BEST_EFFORT_GROUP_AGGREGATE
+           : GROUP_AGGREGATE;
+  }
+
+ private:
+  // Takes ownership of the allocator, key, aggregator, and child.
+  GroupAggregateCursor(const TupleSchema& result_schema,
+                       BufferAllocator* allocator,
+                       BufferAllocator* original_allocator,
+                       GroupKeySet* key,
+                       Aggregator* aggregator,
+                       const BoundMultiSourceProjector* result_projector,
+                       bool best_effort,
+                       Cursor* child)
+      : BasicCursor(result_schema),
+        allocator_(allocator),
+        original_allocator_(CHECK_NOTNULL(original_allocator)),
+        child_(child),
+        key_(key),
+        aggregator_(aggregator),
+        result_(result_schema),
+        result_projector_(result_projector),
+        inserted_keys_(Cursor::kDefaultRowCount),
+        best_effort_(best_effort),
+        input_exhausted_(false),
+        reset_aggregator_in_processinput_(false) {}
+
+  // Process as many rows from input as can fit into result block. If after the
+  // first call to ProcessInput() input_exhausted_ is true, the result is fully
+  // aggregated (there are no rows with equal group by columns).
+  // Initializes the result_ to iterate over the aggregation result.
+  FailureOrVoid ProcessInput();
+
+  // Owned allocator used to allocate the memory.
+  // NOTE: it is used by other member objects created by GroupAggregateCursor so
+  // it has to be destroyed last. Keep it as the first class member.
+  scoped_ptr<const BufferAllocator> allocator_;
+  // Non-owned allocator used to check whether we can allocate more memory or
+  // not.
+  const BufferAllocator* original_allocator_;
+
+  // The input.
+  CursorIterator child_;
+
+  // Holds key columns of the result. Wrapper around RowHashSet.
+  scoped_ptr<GroupKeySet> key_;
+
+  // Holds 'aggregated' columns of the result.
+  scoped_ptr<Aggregator> aggregator_;
+
+  // Iterates over a result of last call to ProcessInput. If
+  // cursor_over_result_->Next() returns EOS and input_exhausted() is false,
+  // ProcessInput needs to be called again to prepare next part of a result and
+  // set cursor_over_result_ to iterate over it.
+  ViewIterator result_;
+
+  // Projector to combine key & aggregated columns into the result.
+  scoped_ptr<const BoundMultiSourceProjector> result_projector_;
+
+  GroupKeySet::FindResult inserted_keys_;
+
+  // If true, OOM is not fatal; the data aggregated up-to OOM are emitted,
+  // and the aggregation starts anew.
+  bool best_effort_;
+
+  // Set when EOS reached in the input stream.
+  bool input_exhausted_;
+
+  // To track when ProcessInput() should reset key_ and aggregator_. It
+  // shouldn't be done after exiting with WAITING_ON_BARRIER - some data might
+  // lost. Reset is also not needed in first ProcessInput() call.
+  bool reset_aggregator_in_processinput_;
+
+  DISALLOW_COPY_AND_ASSIGN(GroupAggregateCursor);
+};
+
+class GroupAggregateOperation : public BasicOperation {
+ public:
+  // Takes ownership of SingleSourceProjector, AggregationSpecification and
+  // child_operation.
+  GroupAggregateOperation(const SingleSourceProjector* group_by,
+                          const AggregationSpecification* aggregation,
+                          GroupAggregateOptions* options,
+                          bool best_effort,
+                          Operation* child)
+      : BasicOperation(child),
+        group_by_(group_by),
+        aggregation_specification_(aggregation),
+        best_effort_(best_effort),
+        options_(options != NULL ? options : new GroupAggregateOptions()) {}
+
+  virtual ~GroupAggregateOperation() {}
+
+  virtual FailureOrOwned<Cursor> CreateCursor() const {
+    FailureOrOwned<Cursor> child_cursor = child()->CreateCursor();
+    PROPAGATE_ON_FAILURE(child_cursor);
+
+    BufferAllocator* original_allocator = buffer_allocator();
+    scoped_ptr<BufferAllocator> allocator;
+    if (options_->enforce_quota()) {
+      allocator.reset(new GuaranteeMemory(options_->memory_quota(),
+                                          original_allocator));
+    } else {
+      allocator.reset(new MemoryLimit(
+          options_->memory_quota(), false, original_allocator));
+    }
+    FailureOrOwned<Aggregator> aggregator = Aggregator::Create(
+        *aggregation_specification_, child_cursor->schema(),
+        allocator.get(),
+        options_->estimated_result_row_count());
+    PROPAGATE_ON_FAILURE(aggregator);
+    FailureOrOwned<const BoundSingleSourceProjector> bound_group_by =
+        group_by_->Bind(child_cursor->schema());
+    PROPAGATE_ON_FAILURE(bound_group_by);
+    return BoundGroupAggregate(
+        bound_group_by.release(), aggregator.release(),
+        allocator.release(),
+        original_allocator,
+        best_effort_,
+        child_cursor.release());
+  }
+
+ private:
+  scoped_ptr<const SingleSourceProjector> group_by_;
+  scoped_ptr<const AggregationSpecification> aggregation_specification_;
+  const bool best_effort_;
+  scoped_ptr<GroupAggregateOptions> options_;
+  DISALLOW_COPY_AND_ASSIGN(GroupAggregateOperation);
+};
+}  // namespace supersonic

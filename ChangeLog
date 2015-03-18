@@ -1,0 +1,57 @@
+News for version 0.9.3 [released: 2013-01-10]
+
+Issues fixes:
+ * BUG ID 9: [https://code.google.com/p/supersonic/issues/detail?id=9]
+   fastmemcmp_inlined is incorrect
+ * BUG ID 8: [https://code.google.com/p/supersonic/issues/detail?id=8]
+   make file under vmware virtual machine
+ * TupleSchema complexity: Projection had O(n^2) complexity on attribute count.
+
+Features:
+ * Cleanup of ViewCopier interface.
+ * Supersonic build in -O3 mode and without -g (no debuging symbols) by default.
+ * guide/join.cc example is simpler now.
+
+--------------------------------------------------------------------------------
+News for version 0.9.2:
+
+Major changes include adding a large set of unit tests and a cursor benchmarking
+feature with utilities for writing benchmarks with some examples. The library
+now also uses Googlemock for testing.
+
+There have also been some bug fixes:
+ - BUG ID: 5 [https://code.google.com/p/supersonic/issues/detail?id=5]
+   Can't link libboost_system when building [FIXED]
+
+Other fixes:
+ - Fixed a temporary file bug which caused Supersonic to crash on successful
+ file creation.
+
+
+--------------------------------------------------------------------------------
+Supersonic Query Engine 0.9.1:
+
+Several build bug fixes:
+ - BUG ID: 1 [https://code.google.com/p/supersonic/issues/detail?id=1]
+   gcc4.6 doesn't support "-R" linker flag; FIXED
+
+ - BUG ID: 2 [https://code.google.com/p/supersonic/issues/detail?id=2]
+   no .gitignore; ADDED
+
+ - BUG ID: 3 [https://code.google.com/p/supersonic/issues/detail?id=3]
+   string_bound_expressions: gcc4.6 reports a "taking address of temporary"
+   error; FIXED
+
+Other fixes:
+ - added conditional Automake flag for determining the archiver - flag is
+   required in AM1.12, and not supported by older AM's
+
+--------------------------------------------------------------------------------
+Supersonic Query Engine 0.9.0:
+
+This is a beta version of the Supersonic Query Engine library. While it should
+be operational, it has not been tested fully and there are only a few exemplary
+tests in the package.
+
+For more details on how to get started see the test/guide directory and the wiki
+on https://code.google.com/p/supersonic .
