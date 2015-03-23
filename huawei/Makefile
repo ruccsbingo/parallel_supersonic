@@ -11,8 +11,6 @@ INCLUDES = -I../ -I../gmock/include/ -I../gmock/gtest/include/
 LDFLAGS = -lglog -lgflags -lprotobuf -lre2 -lboost_timer -lboost_system
 
 HEADERS = \
-    pthreads/barrier.h \
-    pthreads/rwlock.h \
     ../supersonic/base/exception/exception.h \
     ../supersonic/base/exception/exception_macros.h \
     ../supersonic/base/exception/result.h \
@@ -211,8 +209,6 @@ HEADERS = \
     ../supersonic/utils/walltime.h
 
 OBJECTS = \
-    pthreads/barrier.o \
-    pthreads/rwlock.o \
     ../supersonic/base/infrastructure/bit_pointers.o \
     ../supersonic/base/infrastructure/block.o \
     ../supersonic/base/infrastructure/copy_column.o \

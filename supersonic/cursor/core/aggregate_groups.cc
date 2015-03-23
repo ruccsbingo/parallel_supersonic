@@ -63,14 +63,13 @@ using std::vector;
 #include "supersonic/utils/pointer_vector.h"
 #include "supersonic/utils/stl_util.h"
 
-#include "huawei/pthreads/barrier.h"
 #include "huawei/parallel_supersonic.h"
 
-
 extern int g_algorithm_id;
-extern barrier_t barrier;
+extern pthread_barrier_t barrier;
 extern supersonic::row_hash_set::RowHashSet g_key_row_set;
 extern ThreadTag ** threads;
+extern Fine * fine;
 
 namespace supersonic {
 
@@ -104,13 +103,38 @@ class GroupKeySet {
               //group_key_set(GroupKeySet(group_by, allocator, g_key_row_set));
               group_key_set.reset(new GroupKeySet(group_by, allocator, g_key_row_set));
 
-              barrier_wait(&barrier);
+              pthread_barrier_wait(&barrier);
 
               if(pthread_self() == threads[0]->thread_id){
                   PROPAGATE_ON_FAILURE(group_key_set->Init(initial_row_capacity));
               }
 
-              barrier_wait(&barrier);
+              pthread_barrier_wait(&barrier);
+
+              break;
+          case 3:
+              group_key_set.reset(new GroupKeySet(
+                          group_by, 
+                          allocator,
+                          *(fine->table_schema), 
+                          *(fine->key_schema), 
+                          fine->g_index,
+                          fine->g_index_appender,
+                          fine->g_hash,
+                          fine->g_last_row_id,
+                          fine->g_lock_size,
+                          fine->g_prev_row_id,
+                          fine->g_prev_row_id_size,
+                          fine->g_last_row_id_locks,
+                          fine->g_chain_lock));
+
+              pthread_barrier_wait(&barrier);
+
+              if(pthread_self() == threads[0]->thread_id){
+                  PROPAGATE_ON_FAILURE(group_key_set->Init(initial_row_capacity));
+              }
+
+              pthread_barrier_wait(&barrier);
 
               break;
       }
@@ -164,6 +188,35 @@ class GroupKeySet {
 
             key_row_set_.Set(key_row_set.Get());
         }
+
+  GroupKeySet(const BoundSingleSourceProjector* group_by,
+              BufferAllocator* allocator, 
+              TupleSchema& table_schema,
+              TupleSchema& key_schema,
+              Table * g_index,
+              TableRowAppender<DirectRowSourceReader<ViewRowIterator> >* g_index_appender,
+              vector<size_t>* g_hash,
+              int* g_last_row_id,
+              int g_lock_size,
+              int* g_prev_row_id,
+              int g_prev_row_id_size,
+              pthread_rwlock_t** g_last_row_id_locks,
+              pthread_rwlock_t* g_chain_lock)
+      : key_projector_(group_by),
+        child_key_view_(key_projector_->result_schema()),
+        key_row_set_(
+                table_schema, 
+                key_schema, 
+                allocator,
+                g_index,
+                g_index_appender,
+                g_hash,
+                g_last_row_id,
+                g_lock_size,
+                g_prev_row_id,
+                g_prev_row_id_size,
+                g_last_row_id_locks,
+                g_chain_lock) {}
 
   GroupKeySet(const BoundSingleSourceProjector* group_by,
               BufferAllocator* allocator)

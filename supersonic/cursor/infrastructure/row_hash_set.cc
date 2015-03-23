@@ -197,60 +197,62 @@ void RowHashSetImpl::FindInternal(
 size_t RowHashSetImpl::InsertUnique(
     const View& query, const bool_const_ptr selection_vector,
     FindResult* result) {
-  DCHECK(query.schema().EqualByType(index_.schema()))
-      << "Expected: " << index_.schema().GetHumanReadableSpecification()
-      << ", is: " << query.schema().GetHumanReadableSpecification();
-  // Best-effort; if fails, we may end up adding less rows later.
-  ReserveRowCapacity(index_.row_count() + query.row_count());
-  CHECK_GE(arraysize(query_hash_), query.row_count());
 
-  key_selector_->Project(query, &query_key_);
-  HashQuery(query_key_, query.row_count(), query_hash_);
-  comparator_.set_left_view(&query_key_);
+    DCHECK(query.schema().EqualByType(index_.schema()))
+        << "Expected: " << index_.schema().GetHumanReadableSpecification()
+        << ", is: " << query.schema().GetHumanReadableSpecification();
 
-  ViewRowIterator iterator(query);
-  while (iterator.next()) {
-    const int64 query_row_id = iterator.current_row_index();
-    rowid_t* const result_row_id =
-        result ? (result->mutable_row_ids() + query_row_id) : NULL;
-    if (selection_vector != NULL && !selection_vector[query_row_id]) {
-      if (result_row_id)
-          *result_row_id = kInvalidRowId;
-    } else {
-      // TODO(user): The following 12 lines are identical to the piece
-      // of code in FindInternal. Needs refactoring (but be careful about a
-      // performance regression).
-      int hash_index = (hash_mask_ & query_hash_[query_row_id]);
-      int index_row_id = last_row_id_[hash_index];
+    // Best-effort; if fails, we may end up adding less rows later.
+    ReserveRowCapacity(index_.row_count() + query.row_count());
+    CHECK_GE(arraysize(query_hash_), query.row_count());
 
-      if (comparator_.hash_comparison_only()) {
-        while (index_row_id != -1 &&
-               (query_hash_[query_row_id] != hash_[index_row_id])) {
-          index_row_id = prev_row_id_[index_row_id];
+    key_selector_->Project(query, &query_key_);
+    HashQuery(query_key_, query.row_count(), query_hash_);
+    comparator_.set_left_view(&query_key_);
+
+    ViewRowIterator iterator(query);
+    while (iterator.next()) {
+        const int64 query_row_id = iterator.current_row_index();
+        rowid_t* const result_row_id =
+            result ? (result->mutable_row_ids() + query_row_id) : NULL;
+        if (selection_vector != NULL && !selection_vector[query_row_id]) {
+            if (result_row_id)
+                *result_row_id = kInvalidRowId;
+        } else {
+            // TODO(user): The following 12 lines are identical to the piece
+            // of code in FindInternal. Needs refactoring (but be careful about a
+            // performance regression).
+            int hash_index = (hash_mask_ & query_hash_[query_row_id]);
+            int index_row_id = last_row_id_[hash_index];
+
+            if (comparator_.hash_comparison_only()) {
+                while (index_row_id != -1 &&
+                        (query_hash_[query_row_id] != hash_[index_row_id])) {
+                    index_row_id = prev_row_id_[index_row_id];
+                }
+            } else {
+                while (index_row_id != -1 &&
+                        (query_hash_[query_row_id] != hash_[index_row_id]
+                         || !comparator_.Equal(query_row_id, index_row_id))) {
+                    index_row_id = prev_row_id_[index_row_id];
+                }
+            }
+
+            if (index_row_id == -1) {
+                index_row_id = index_.row_count();
+                if (index_row_id  == index_.row_capacity() ||
+                        !index_appender_.AppendRow(iterator)) break;
+                hash_.push_back(query_hash_[query_row_id]);
+                prev_row_id_[index_row_id] = last_row_id_[hash_index];
+                last_row_id_[hash_index] = index_row_id;
+            }
+            if (result_row_id)
+                *result_row_id = index_row_id;
         }
-      } else {
-        while (index_row_id != -1 &&
-               (query_hash_[query_row_id] != hash_[index_row_id]
-                || !comparator_.Equal(query_row_id, index_row_id))) {
-          index_row_id = prev_row_id_[index_row_id];
-        }
-      }
-
-      if (index_row_id == -1) {
-        index_row_id = index_.row_count();
-        if (index_row_id  == index_.row_capacity() ||
-            !index_appender_.AppendRow(iterator)) break;
-        hash_.push_back(query_hash_[query_row_id]);
-        prev_row_id_[index_row_id] = last_row_id_[hash_index];
-        last_row_id_[hash_index] = index_row_id;
-      }
-      if (result_row_id)
-        *result_row_id = index_row_id;
     }
-  }
-
-  return iterator.current_row_index();
+    return iterator.current_row_index();
 }
+
 
 size_t RowHashSetImpl::InsertMany(
     const View& query, const bool_const_ptr selection_vector,
@@ -382,12 +384,86 @@ void RowHashSetImpl::HashQuery(
   }
 }
 
+//index_ has fixed capacity
+//hash_ has fixed capacity
+//last_row_id_size_ has fixed size
+//last_row_id has fixed size
+//hash_mask has fixed size
+//prev_row_id_ needs grown
+bool FineSafeRowHashSetImpl::ReserveRowCapacity(rowcount_t block_capacity){
+
+  return true;
+}
+
+// RowSet variant.
+size_t FineSafeRowHashSetImpl::InsertUnique(
+        const View& query, const bool_const_ptr selection_vector,
+        FindResult* result){
+
+    static int hash_counter = 0;
+
+    key_selector_->Project(index_->view(), &index_key_);
+    key_selector_->Project(query, &query_key_);
+    HashQuery(query_key_, query.row_count(), query_hash_);
+
+    ViewRowIterator iterator(query);
+    while (iterator.next()) {
+        const int64 query_row_id = iterator.current_row_index();
+        rowid_t* const result_row_id =
+            result ? (result->mutable_row_ids() + query_row_id) : NULL;
+
+        // TODO(user): The following 12 lines are identical to the piece
+        // of code in FindInternal. Needs refactoring (but be careful about a
+        // performance regression).
+        int hash_index = (hash_mask_ & query_hash_[query_row_id]);
+
+        //read last_row_id_
+        pthread_rwlock_wrlock(last_row_id_locks_[hash_index]);
+        int index_row_id = last_row_id_[hash_index];
+
+        while (index_row_id != -1 &&
+                //read hash_
+                (query_hash_[query_row_id] != (*hash_)[index_row_id]
+                 || query_key_.column(0).typed_data<INT32>()[query_row_id] 
+                    != index_->view().column(0).typed_data<INT32>()[index_row_id])) {
+            //read prev_row_id_
+            index_row_id = prev_row_id_[index_row_id];
+        }
+
+        if (index_row_id == -1) {
+            //we need a chain lock
+            pthread_rwlock_wrlock(chain_lock_);
+
+            //read index_
+            index_row_id = index_->row_count();
+            index_appender_->AppendRow(iterator);
+
+            //write hash_
+            hash_->push_back(query_hash_[query_row_id]);
+
+            //read last_row_id_[hash_index] and write prev_row_id_
+            prev_row_id_[index_row_id] = last_row_id_[hash_index];
+
+            //write last_row_id_ 
+            last_row_id_[hash_index] = index_row_id;
+
+            pthread_rwlock_unlock(chain_lock_);
+        }
+        if (result_row_id)
+            *result_row_id = index_row_id;
+
+        pthread_rwlock_unlock(last_row_id_locks_[hash_index]);
+    }
+
+    return iterator.current_row_index();
+}
+
 size_t RoughSafeRowHashSetImpl::InsertUnique(
     const View& query, const bool_const_ptr selection_vector,
     FindResult* result) {
 
     int status;
-    status = rwlock_writelock(&rough_lock_);
+    status = pthread_rwlock_wrlock(&rough_lock_);
     if(status != 0){
         std::cout<<status<<"write lock failure"<<std::endl;
     }
@@ -446,7 +522,7 @@ size_t RoughSafeRowHashSetImpl::InsertUnique(
         }
     }
 
-    status = rwlock_writeunlock(&rough_lock_);
+    status = pthread_rwlock_unlock(&rough_lock_);
     if(status != 0){
         std::cout<<status<<"write unlock failure"<<std::endl;
     }
@@ -467,6 +543,35 @@ RowHashSet::RowHashSet(
     BufferAllocator* const allocator,
     const BoundSingleSourceProjector* key_selector)
     : impl_(new RowHashSetImpl(block_schema, allocator, key_selector, false)) {}
+
+    RowHashSet::RowHashSet(
+            const TupleSchema& table_schema,
+            const TupleSchema& key_schema,
+            BufferAllocator* const allocator,
+            Table * g_index,
+            TableRowAppender<DirectRowSourceReader<ViewRowIterator> >* g_index_appender,
+            vector<size_t>* g_hash,
+            int* g_last_row_id,
+            int g_lock_size,
+            int* g_prev_row_id,
+            int g_prev_row_id_size, 
+            pthread_rwlock_t** g_last_row_id_locks,
+            pthread_rwlock_t* g_chain_lock){
+
+        impl_ = new FineSafeRowHashSetImpl(
+                    table_schema, 
+                    key_schema, 
+                    allocator, 
+                    g_index,
+                    g_index_appender,
+                    g_hash,
+                    g_last_row_id,
+                    g_lock_size,
+                    g_prev_row_id,
+                    g_prev_row_id_size,
+                    g_last_row_id_locks,
+                    g_chain_lock);
+    }
 
 RowHashSet::~RowHashSet() {
     //To do: This pointer will be delete several times in multi-threads environment,

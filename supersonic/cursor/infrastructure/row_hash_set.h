@@ -26,8 +26,6 @@
 #include "supersonic/base/infrastructure/types.h"
 #include "supersonic/cursor/infrastructure/table.h"
 
-#include "huawei/pthreads/rwlock.h"
-
 namespace supersonic {
 
 class BoundSingleSourceProjector;
@@ -42,6 +40,7 @@ static const rowid_t kInvalidRowId = -1;
 class FindMultiResult;
 class FindResult;
 class RowHashSetImpl;
+class FineSafeRowHashSetImpl;
 
 // A row container that stores rows in an internal storage block (defined by
 // a schema passed in constructor) and groups rows with identical keys together.
@@ -82,6 +81,20 @@ class RowHashSet {
   RowHashSet(const TupleSchema& block_schema,
              BufferAllocator* const allocator,
              const BoundSingleSourceProjector* key_selector);
+
+  RowHashSet(
+          const TupleSchema& table_schema,
+          const TupleSchema& key_schema,
+          BufferAllocator* const allocator,
+          Table * g_index,
+          TableRowAppender<DirectRowSourceReader<ViewRowIterator> >* g_index_appender,
+          vector<size_t>* g_hash,
+          int* g_last_row_id,
+          int g_lock_size,
+          int* g_prev_row_id,
+          int g_prev_row_id_size,
+          pthread_rwlock_t** g_last_row_id_locks,
+          pthread_rwlock_t* g_chain_lock);
 
   // Ensures that the hash set has capacity for at least the specified
   // number of rows. Returns false on OOM. Using this method may reduce
@@ -315,7 +328,7 @@ class RowHashSetImpl {
       const BoundSingleSourceProjector* key_selector,
       bool is_multiset);
 
-  bool ReserveRowCapacity(rowcount_t block_capacity);
+  virtual bool ReserveRowCapacity(rowcount_t block_capacity);
 
   // RowSet variant.
   void FindUnique(
@@ -337,11 +350,11 @@ class RowHashSetImpl {
       const View& query, const bool_const_ptr selection_vector,
       FindMultiResult* result);
 
-  void Clear();
+  virtual void Clear();
 
-  void Compact();
+  virtual void Compact();
 
-  const View& indexed_view() const { return index_.view(); }
+  virtual const View& indexed_view() const { return index_.view(); }
 
  //private:
  protected:
@@ -412,12 +425,84 @@ class RowHashSetImpl {
   friend class RowIdSetIterator;
 };
 
+class FineSafeRowHashSetImpl:public RowHashSetImpl{
+    public:
+        FineSafeRowHashSetImpl(
+                const TupleSchema &table_schema, 
+                const TupleSchema &key_schema, 
+                BufferAllocator* allocator, 
+                Table * g_index,
+                TableRowAppender<DirectRowSourceReader<ViewRowIterator> >* g_index_appender,
+                vector<size_t>* g_hash,
+                int* g_last_row_id,
+                int g_lock_size,
+                int* g_prev_row_id,
+                int g_prev_row_id_size,
+                pthread_rwlock_t** g_last_row_id_locks,
+                pthread_rwlock_t* g_chain_lock)
+            : RowHashSetImpl(key_schema, allocator, NULL, false),
+            last_row_id_size_(g_lock_size),
+            hash_mask_(g_lock_size - 1)
+    {
+
+        index_ =  g_index;
+        index_appender_ =  g_index_appender;
+        hash_ = g_hash;
+        last_row_id_ = g_last_row_id;
+        prev_row_id_ = g_prev_row_id;
+        prev_row_id_size_ = g_prev_row_id_size;
+        last_row_id_locks_ = g_last_row_id_locks;
+        chain_lock_ = g_chain_lock;
+    }
+
+  virtual const View& indexed_view() const { return index_->view(); }
+
+  virtual bool ReserveRowCapacity(rowcount_t block_capacity);
+
+  // RowSet variant.
+  virtual size_t InsertUnique(
+      const View& query, const bool_const_ptr selection_vector,
+      FindResult* result);
+
+  private:
+
+  // Contains all inserted rows; Find and Insert match against these rows
+  // using last_row_id_ and prev_row_id_.
+  Table* index_;
+
+  TableRowAppender<DirectRowSourceReader<ViewRowIterator> >* index_appender_;
+
+  //  Array for keeping block rows' hashes.
+  vector<size_t>* hash_;
+
+  int hash_mask_;
+
+  // Size of last_row_id_. Should be power of 2. Adjusted by ReserveRowCapacity.
+  int last_row_id_size_;
+
+  // Value of last_row_id_[hash_index] denotes position of last row in
+  // indexed_block_ having same value of hash_index =
+  // (query_hash_[query_row_id] & hash_mask_).
+  int* last_row_id_;
+
+  // Index of a previous row having the same hash_index = (row.hash &
+  // hash_mask_) but a different key. (For multisets, there may be many rows
+  // with the same key (and thus hash); only the first instance is actually
+  // written to this array).
+  int* prev_row_id_;
+  int prev_row_id_size_;
+
+  //last_row_id_ has read-write-conflict
+  pthread_rwlock_t** last_row_id_locks_;
+  pthread_rwlock_t* chain_lock_;
+};
+
 class RoughSafeRowHashSetImpl:public RowHashSetImpl{
  public:
      RoughSafeRowHashSetImpl(TupleSchema &schema, BufferAllocator* allocator)
          : RowHashSetImpl(schema, allocator, NULL, false) {
              //To do: init its base class RowHashSetImpl
-             int status = rwlock_init(&rough_lock_);
+             int status = pthread_rwlock_init(&rough_lock_, NULL);
              if(status != 0){
                  std::cout<<status<<"init lock failure"<<std::endl;
              }
@@ -429,7 +514,18 @@ class RoughSafeRowHashSetImpl:public RowHashSetImpl{
       FindResult* result);
 
  private:
-  rwlock_t rough_lock_;
+  pthread_rwlock_t rough_lock_;
+};
+
+class FileSafeRowHashSetImpl:public RowHashSetImpl{
+  public:
+      FileSafeRowHashSetImpl(TupleSchema &schema, BufferAllocator* allocator)
+          : RowHashSetImpl(schema, allocator, NULL, false){
+
+          }
+
+  private:
+
 };
 
 class RowHashMultiSet {
@@ -537,6 +633,7 @@ class FindResult {
 
   friend class RowHashSetImpl;
   friend class RoughSafeRowHashSetImpl;
+  friend class FineSafeRowHashSetImpl;
 };
 
 

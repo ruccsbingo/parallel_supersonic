@@ -19,6 +19,7 @@
 #include "supersonic/cursor/core/aggregator.h"
 #include "supersonic/cursor/core/spy.h"
 #include "supersonic/cursor/core/sort.h"
+#include "supersonic/cursor/core/benchmarks.h"
 #include "supersonic/cursor/infrastructure/ordering.h"
 #include "supersonic/cursor/infrastructure/row_hash_set.h"
 #include "supersonic/proto/supersonic.pb.h"
@@ -36,4 +37,19 @@ typedef struct ThreadTag{
     supersonic::row_hash_set::RowHashSet* key;              
 }ThreadTag;
 
+typedef struct FineTag{
+    supersonic::TupleSchema* table_schema;
+    supersonic::TupleSchema* key_schema;
+    supersonic::Table * g_index;
+    supersonic::TableRowAppender<supersonic::DirectRowSourceReader<supersonic::ViewRowIterator> >
+        * g_index_appender;
+    std::vector<size_t>* g_hash;
+    int* g_last_row_id;
+    int g_lock_size;
+    int* g_prev_row_id;
+    int g_prev_row_id_size;
+    //last_row_id_ has read-write-conflict
+    pthread_rwlock_t** g_last_row_id_locks;
+    pthread_rwlock_t* g_chain_lock;
+}Fine;
 #endif
